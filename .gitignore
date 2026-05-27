@@ -1,0 +1,45 @@
+# Git ignore para o Agente de Suporte NOC
+
+# Variáveis de ambiente (NUNCA commite!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Ambientes virtuais
+venv/
+env/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Artefatos do Ansible Runner (temporários)
+artifacts/
+/tmp/ansible-runner-*/
+
+# Pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Segurança: chaves e certificados
+*.pem
+*.key
+*.crt
+id_rsa
+id_ed25519
+known_hosts

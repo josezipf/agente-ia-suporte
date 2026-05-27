@@ -1,0 +1,25 @@
+---
+# ============================================================
+# playbooks/reboot_cpe.yml
+# Reinicia o CPE MikroTik RouterOS
+#
+# Variáveis esperadas:
+#   target_host: IP do CPE
+#   ansible_user: admin (injetado via tools/ansible.py)
+# ============================================================
+
+- name: "Reboot do CPE MikroTik"
+  hosts: "{{ target_host }}"
+  gather_facts: false
+
+  tasks:
+    - name: "Executar reboot no RouterOS (com delay de 2s para fechar SSH de forma limpa)"
+      ansible.builtin.raw: ':execute script=":delay 2s; /system reboot"'
+
+    - name: "Aguardar queda do SSH"
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: "✅ CPE reiniciado"
+      ansible.builtin.debug:
+        msg: "Comando de reboot enviado ao MikroTik RouterOS. Aguarde 3-5 minutos para o restabelecimento completo."

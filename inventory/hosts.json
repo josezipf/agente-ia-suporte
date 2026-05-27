@@ -1,0 +1,1 @@
+{"all": {"hosts": {"192.168.6.55": {"ansible_user": "admin", "ansible_ssh_use_tty": false}}}}

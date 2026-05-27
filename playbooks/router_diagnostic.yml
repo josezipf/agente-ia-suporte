@@ -1,0 +1,50 @@
+---
+# ============================================================
+# playbooks/router_diagnostic.yml
+# Diagnóstico completo do roteador/CPE MikroTik RouterOS
+#
+# Variáveis esperadas:
+#   target_host: IP do CPE
+#   ansible_user: admin (injetado via tools/ansible.py)
+# ============================================================
+
+- name: "Diagnóstico de Roteador MikroTik RouterOS"
+  hosts: "{{ target_host }}"
+  gather_facts: false
+
+  tasks:
+    - name: "Verificar recursos do sistema (CPU/Memória)"
+      ansible.builtin.raw: "/system resource print"
+      register: system_resource
+      ignore_errors: true
+
+    - name: "Exibir recursos do sistema"
+      ansible.builtin.debug:
+        msg: "Recursos do CPE MikroTik:\n{{ system_resource.stdout }}"
+
+    - name: "Verificar tabela de rotas"
+      ansible.builtin.raw: "/ip route print"
+      register: route_table
+      ignore_errors: true
+
+    - name: "Exibir tabela de rotas"
+      ansible.builtin.debug:
+        msg: "Tabela de rotas do CPE:\n{{ route_table.stdout }}"
+
+    - name: "Verificar interfaces"
+      ansible.builtin.raw: "/interface print"
+      register: interfaces
+      ignore_errors: true
+
+    - name: "Exibir status das interfaces"
+      ansible.builtin.debug:
+        msg: "Status das interfaces do CPE:\n{{ interfaces.stdout }}"
+
+    - name: "Teste de ping para DNS do Google"
+      ansible.builtin.raw: "/ping count=3 address=8.8.8.8"
+      register: ping_google
+      ignore_errors: true
+
+    - name: "Exibir resultado do ping Google"
+      ansible.builtin.debug:
+        msg: "Ping Google (8.8.8.8):\n{{ ping_google.stdout }}"

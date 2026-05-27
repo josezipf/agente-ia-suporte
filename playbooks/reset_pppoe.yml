@@ -1,0 +1,38 @@
+---
+# ============================================================
+# playbooks/reset_pppoe.yml
+# Reinicia o cliente PPPoE do CPE MikroTik RouterOS
+#
+# Variáveis esperadas:
+#   target_host: IP do CPE
+#   ansible_user: admin (injetado via tools/ansible.py)
+# ============================================================
+
+- name: "Reset de PPPoE no MikroTik"
+  hosts: "{{ target_host }}"
+  gather_facts: false
+
+  tasks:
+    - name: "Desabilitar interfaces PPPoE Client"
+      ansible.builtin.raw: "/interface pppoe-client disable [find]"
+      register: ppp_down
+
+    - name: "Aguardar 5 segundos"
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: "Habilitar interfaces PPPoE Client"
+      ansible.builtin.raw: "/interface pppoe-client enable [find]"
+      register: ppp_up
+
+    - name: "Aguardar 10 segundos para restabelecer a conexão"
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: "Monitorar status do PPPoE"
+      ansible.builtin.raw: "/interface pppoe-client monitor [find] once"
+      register: ppp_status
+
+    - name: "Exibir status final da conexão PPPoE"
+      ansible.builtin.debug:
+        msg: "Status do PPPoE:\n{{ ppp_status.stdout }}"
