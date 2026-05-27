@@ -18,6 +18,7 @@ import os
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +81,28 @@ async def lifespan(app: FastAPI):
     logger.info("   Ferramentas registradas: %d", len(ALL_TOOLS))
     for tool in ALL_TOOLS:
         logger.info("   ✅ %s", tool.name)
+    # Configura webhook do Telegram se as variáveis existirem
+    tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    tg_webhook = os.getenv("TELEGRAM_WEBHOOK_URL")
+    if tg_token and tg_webhook:
+        webhook_target = f"{tg_webhook.rstrip('/')}/webhook/telegram/{tg_token}"
+        logger.info("🤖 Configurando Webhook do Telegram para: %s", webhook_target)
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{tg_token}/setWebhook",
+                    json={"url": webhook_target},
+                    timeout=10.0
+                )
+                resp_json = resp.json()
+                if resp_json.get("ok"):
+                    logger.info("✅ Webhook do Telegram registrado com sucesso!")
+                else:
+                    logger.error("❌ Falha ao registrar Webhook: %s", resp_json.get("description"))
+        except Exception as e:
+            logger.error("❌ Erro ao conectar na API do Telegram: %s", e)
+    else:
+        logger.info("ℹ️ Telegram não configurado (TELEGRAM_BOT_TOKEN / TELEGRAM_WEBHOOK_URL ausentes)")
     logger.info("=" * 60)
     yield
     logger.info("🛑 Agente de Suporte NOC encerrando...")
@@ -257,6 +280,37 @@ def get_or_create_session(session_id: str | None) -> tuple[str, list[dict], str 
     }
     logger.info("Nova sessão criada: %s", new_id)
     return new_id, [], None, []
+
+
+def get_or_create_external_session(session_id: str) -> tuple[str, list[dict], str | None, list[str]]:
+    """
+    Retorna uma sessão externa existente (ex: Telegram/WhatsApp) ou cria uma nova.
+    Evita a necessidade de validação por UUID para IDs vindos de APIs externas.
+    """
+    if session_id in session_store:
+        session_data = session_store[session_id]
+        if isinstance(session_data, dict):
+            return (
+                session_id,
+                session_data.get("history", []),
+                session_data.get("client_ip"),
+                session_data.get("actions_taken", []),
+            )
+
+    if len(session_store) >= MAX_SESSIONS:
+        oldest_key = next(iter(session_store))
+        del session_store[oldest_key]
+        logger.warning("Limite de sessões atingido. Sessão mais antiga removida.")
+
+    session_store[session_id] = {
+        "history": [],
+        "client_ip": None,
+        "actions_taken": [],
+        "req_count": 0,
+        "window_start": datetime.now(timezone.utc),
+    }
+    logger.info("Nova sessão externa criada: %s", session_id)
+    return session_id, [], None, []
 
 
 def trim_history(history: list[dict]) -> list[dict]:
@@ -471,6 +525,94 @@ async def clear_session(
 # ============================================================
 # Ponto de Entrada
 # ============================================================
+
+
+
+
+# ============================================================
+# ENDPOINT: POST /webhook/telegram/{token}
+# ============================================================
+
+async def _send_telegram_message(token: str, chat_id: int, text: str):
+    """Envia uma mensagem de texto para o chat do Telegram."""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(url, json={"chat_id": chat_id, "text": text}, timeout=10.0)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error("Erro ao enviar mensagem ao Telegram: %s", e)
+
+
+async def _send_telegram_typing(token: str, chat_id: int):
+    """Envia a ação de 'digitando...' ao chat do Telegram."""
+    url = f"https://api.telegram.org/bot{token}/sendChatAction"
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, json={"chat_id": chat_id, "action": "typing"}, timeout=5.0)
+        except Exception:
+            pass  # Se falhar, não impede o bot de funcionar
+
+
+@app.post(
+    "/webhook/telegram/{token}",
+    summary="Receber mensagens do Telegram",
+    description="Endpoint de webhook para processar mensagens enviadas pelo Telegram.",
+    tags=["Webhooks"],
+)
+async def telegram_webhook(token: str, request: Request):
+    """Recebe mensagens do Telegram, processa com o Agente e responde."""
+    env_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not env_token or token != env_token:
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload inválido.")
+
+    # Filtra apenas mensagens com texto
+    if "message" not in payload or "text" not in payload["message"]:
+        return {"status": "ignored"}
+
+    chat_id = payload["message"]["chat"]["id"]
+    user_message = payload["message"]["text"].strip()
+    session_id = f"telegram_{chat_id}"
+
+    if not user_message:
+        return {"status": "ignored"}
+
+    # Resgata ou inicia a sessão externa do Telegram
+    _, history, client_ip, actions_taken = get_or_create_external_session(session_id)
+
+    # Avisa ao Telegram que o bot está "digitando..."
+    await _send_telegram_typing(token, chat_id)
+
+    try:
+        # Roda o agente NOC em thread para não travar o loop assíncrono
+        agent_response, updated_history, new_client_ip, updated_actions = await asyncio.to_thread(
+            run_agent, user_message, history, client_ip, actions_taken
+        )
+
+        # Atualiza a sessão
+        existing = session_store.get(session_id, {})
+        session_store[session_id] = {
+            "history": trim_history(updated_history),
+            "client_ip": new_client_ip or client_ip,
+            "actions_taken": updated_actions,
+            "req_count": existing.get("req_count", 1),
+            "window_start": existing.get("window_start", datetime.now(timezone.utc)),
+        }
+
+        # Envia a resposta final gerada pelo agente
+        await _send_telegram_message(token, chat_id, agent_response)
+
+    except Exception:
+        logger.exception("Erro ao processar mensagem do Telegram para chat_id %s", chat_id)
+        await _send_telegram_message(token, chat_id, "Desculpe, ocorreu um erro interno ao processar sua solicitação.")
+
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     host = os.getenv("API_HOST", "0.0.0.0")
