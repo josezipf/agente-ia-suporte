@@ -614,6 +614,184 @@ async def telegram_webhook(token: str, request: Request):
     return {"status": "ok"}
 
 
+
+
+
+# ============================================================
+# ENDPOINT: GET & POST /webhook/whatsapp
+# ============================================================
+
+async def _send_whatsapp_message(token: str, phone_number_id: str, recipient: str, text: str):
+    """Envia uma mensagem de texto usando a API de Nuvem do WhatsApp (Meta)."""
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "text",
+        "text": {"body": text},
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(url, json=payload, headers=headers, timeout=10.0)
+            resp.raise_for_status()
+            logger.info("Mensagem enviada com sucesso para o WhatsApp: %s", recipient)
+        except Exception as e:
+            logger.error("Erro ao enviar mensagem ao WhatsApp: %s", e)
+
+
+async def _mark_whatsapp_read(token: str, phone_number_id: str, message_id: str):
+    """Marca uma mensagem recebida no WhatsApp como lida (check azul)."""
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post(url, json=payload, headers=headers, timeout=5.0)
+        except Exception:
+            pass  # Falhar no status de leitura não interrompe o bot
+
+
+async def _process_and_reply_whatsapp(
+    token: str,
+    phone_number_id: str,
+    session_id: str,
+    recipient: str,
+    message: str,
+    history: list[dict],
+    client_ip: str | None,
+    actions_taken: list[str]
+):
+    """Processa a mensagem e envia a resposta de volta ao WhatsApp (background task)."""
+    try:
+        agent_response, updated_history, new_client_ip, updated_actions = await asyncio.to_thread(
+            run_agent, message, history, client_ip, actions_taken
+        )
+
+        # Atualiza a sessão
+        existing = session_store.get(session_id, {})
+        session_store[session_id] = {
+            "history": trim_history(updated_history),
+            "client_ip": new_client_ip or client_ip,
+            "actions_taken": updated_actions,
+            "req_count": existing.get("req_count", 1),
+            "window_start": existing.get("window_start", datetime.now(timezone.utc)),
+        }
+
+        # Envia a resposta final gerada pelo agente
+        await _send_whatsapp_message(token, phone_number_id, recipient, agent_response)
+
+    except Exception:
+        logger.exception("Erro no processamento em background do WhatsApp para %s", recipient)
+        await _send_whatsapp_message(token, phone_number_id, recipient, "Desculpe, ocorreu um erro interno ao processar sua solicitação.")
+
+
+@app.get(
+    "/webhook/whatsapp",
+    summary="Validar Webhook do WhatsApp",
+    description="Endpoint GET exigido pela Meta para verificar o webhook do WhatsApp.",
+    tags=["Webhooks"],
+)
+async def verify_whatsapp_webhook(request: Request):
+    """Valida o webhook do WhatsApp respondendo ao desafio (challenge) da Meta."""
+    params = request.query_params
+    verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN")
+
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and token == verify_token:
+        logger.info("✅ Webhook do WhatsApp validado com sucesso pela Meta!")
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(challenge)
+
+    logger.warning("❌ Falha na validação do webhook do WhatsApp. Token incorreto.")
+    raise HTTPException(status_code=403, detail="Token de verificação inválido.")
+
+
+@app.post(
+    "/webhook/whatsapp",
+    summary="Receber mensagens do WhatsApp",
+    description="Endpoint POST para processar as mensagens enviadas pelos clientes via WhatsApp.",
+    tags=["Webhooks"],
+)
+async def whatsapp_webhook(request: Request):
+    """Recebe mensagens do WhatsApp, dispara a resposta em background e responde 200 OK imediatamente."""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Payload inválido.")
+
+    # Filtra as mensagens recebidas
+    try:
+        entry = payload.get("entry", [])[0]
+        change = entry.get("changes", [])[0]
+        value = change.get("value", {})
+
+        if "messages" not in value:
+            return {"status": "ignored"}
+
+        message_data = value["messages"][0]
+        msg_type = message_data.get("type")
+
+        # Apenas processa mensagens do tipo texto
+        if msg_type != "text":
+            return {"status": "ignored"}
+
+        from_number = message_data.get("from")
+        message_id = message_data.get("id")
+        user_message = message_data.get("text", {}).get("body", "").strip()
+
+        if not from_number or not user_message:
+            return {"status": "ignored"}
+
+        session_id = f"whatsapp_{from_number}"
+        
+        token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+        phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+
+        if not token or not phone_number_id:
+            logger.error("WhatsApp não configurado. Defina WHATSAPP_ACCESS_TOKEN e WHATSAPP_PHONE_NUMBER_ID no .env")
+            return {"status": "error", "message": "WhatsApp credentials not configured"}
+
+        # Resgata ou cria sessão externa
+        _, history, client_ip, actions_taken = get_or_create_external_session(session_id)
+
+        # Marca a mensagem como lida (check azul)
+        await _mark_whatsapp_read(token, phone_number_id, message_id)
+
+        # Dispara o processamento em background (evita estourar o timeout de 3s da Meta)
+        asyncio.create_task(
+            _process_and_reply_whatsapp(
+                token=token,
+                phone_number_id=phone_number_id,
+                session_id=session_id,
+                recipient=from_number,
+                message=user_message,
+                history=history,
+                client_ip=client_ip,
+                actions_taken=actions_taken
+            )
+        )
+
+    except Exception:
+        logger.exception("Erro ao processar webhook do WhatsApp")
+
+    return {"status": "ok"}
+
+
 if __name__ == "__main__":
     host = os.getenv("API_HOST", "0.0.0.0")
     port = int(os.getenv("API_PORT", "8000"))
