@@ -638,6 +638,8 @@ async def _send_whatsapp_message(token: str, phone_number_id: str, recipient: st
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=10.0)
+            if resp.status_code >= 400:
+                logger.error("Meta API error response: %d - %s", resp.status_code, resp.text)
             resp.raise_for_status()
             logger.info("Mensagem enviada com sucesso para o WhatsApp: %s", recipient)
         except Exception as e:
